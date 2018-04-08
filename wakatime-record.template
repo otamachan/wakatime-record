@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Wakatime Record'
+Parameters:
+  APIKey:
+    Type: String
+    Description: Wakatime API Key
+    NoEcho: true
+    AllowedPattern: >-
+      [a-z0-9\-]{36}
+    ConstraintDescription: must be a valid api key
+  BucketName:
+    Type: String
+    Description: S3 bucket name to upload records
+    AllowedPattern: >-
+      [a-zA-Z][a-zA-Z0-9-]*
+    ConstraintDescription: must be a valid bucket name
+  KeyPrefix:
+    Type: String
+    Description: S3 key prefix to upload records
+    AllowedPattern: >-
+      [a-zA-Z][a-zA-Z0-9-]*
+Resources:
+  Schedule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      ScheduleExpression: "cron(0 14 ? * SUN *)"
+      Targets:
+      - Arn: !GetAtt LambdaFunction.Arn
+        Id: TargetFunctionV1
+  PermissionInvokeLambdaFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: LambdaFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Schedule.Arn
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Principal:
+              Service: ['lambda.amazonaws.com']
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                Resource: !Join
+                  - ''
+                  - - 'arn:aws:s3:::'
+                    - !Ref BucketName
+                    - '/'
+                    - !Ref KeyPrefix
+                    - '*'
+        - PolicyName: logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Join
+                  - ':'
+                  - - 'arn:aws:logs'
+                    - !Ref AWS::Region
+                    - !Ref AWS::AccountId
+                    - '*'
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: 'Wakatime recorder'
+      Environment:
+        Variables:
+          API_KEY: !Ref APIKey
+          BUCKET_NAME: !Ref BucketName
+          KEY_PREFIX: !Ref KeyPrefix
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.6
+      Timeout: 30
+      Code:
+        ZipFile: |
+          # -*- coding: utf-8 -*-
+          
+          import boto3
+          import base64
+          import datetime
+          import json
+          import os
+          import urllib.request
+          
+          
+          def get_wakatime(api_key, path):
+              encoded_api_key = base64.encodestring(api_key.encode('utf-8')).decode('ascii')
+              req = urllib.request.Request(
+                  'https://wakatime.com/api/v1/' + path,
+                  headers={'Authorization': 'Basic {}'.format(encoded_api_key[:-1])})
+              return json.loads(urllib.request.urlopen(req).read().decode('ascii'))
+          
+          
+          def get_duration(api_key, day):
+              return get_wakatime(
+                  api_key,
+                  'users/current/durations?date={}'.format(day.isoformat()))
+
+          
+          def get_summaries(api_key, day):
+              return get_wakatime(
+                  api_key,
+                  'users/current/summaries?start={0}&end={1}'.
+                  format(day.isoformat(), day.isoformat()))
+          
+          
+          def upload_to_s3(bucket, key, data):
+              s3 = boto3.resource('s3')
+              obj = s3.Object(bucket, key)
+              obj.put(Body=json.dumps(data))
+              print('uploaded {0}/{1}: {2}-{3}'.
+                    format(bucket, key, data['start'], data['end']))
+          
+          
+          def record_wakatime(api_key, bucket, prefix):
+              today = datetime.date.today()
+              for days in range(7):
+                  d = today - datetime.timedelta(days=days+1)
+                  upload_to_s3(
+                      bucket,
+                      '{0}/{1}-duration.json'.format(prefix, d.isoformat()),
+                      get_duration(api_key, d))
+                  upload_to_s3(
+                      bucket,
+                      '{0}/{1}-summaries.json'.format(prefix, d.isoformat()),
+                      get_summaries(api_key, d))
+          
+          
+          def lambda_handler(event, context):
+              api_key = os.environ.get('API_KEY')
+              bucket = os.environ.get('BUCKET_NAME')
+              prefix = os.environ.get('KEY_PREFIX')
+              record_wakatime(api_key, bucket, prefix)
